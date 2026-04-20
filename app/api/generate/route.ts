@@ -1,8 +1,40 @@
 import Anthropic from "@anthropic-ai/sdk";
+// Simple in-memory rate limiter (resets when server restarts)
+const requestCounts = new Map<string, { count: number; resetAt: number }>();
+const DAILY_LIMIT = 10;
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const record = requestCounts.get(ip);
+
+  if (!record || now > record.resetAt) {
+    requestCounts.set(ip, {
+      count: 1,
+      resetAt: now + 24 * 60 * 60 * 1000, // 24 hours
+    });
+    return true;
+  }
+
+  if (record.count >= DAILY_LIMIT) {
+    return false;
+  }
+
+  record.count++;
+  return true;
+}
 
 const client = new Anthropic();
 
 export async function POST(req: Request) {
+  const ip = req.headers.get("x-forwarded-for") || "unknown";
+if (!checkRateLimit(ip)) {
+  return Response.json(
+    {
+      error: "Daily limit reached (10 questions/day). Upgrade to Pro for unlimited.",
+    },
+    { status: 429 }
+  );
+}
   try {
     const { description } = await req.json();
 
