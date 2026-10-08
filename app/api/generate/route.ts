@@ -8,7 +8,7 @@ import {
   type Plan,
 } from "@/lib/formula";
 import { checkLicense, keyId } from "@/lib/license";
-import { consume, envInt } from "@/lib/usage";
+import { consume, envInt, refund } from "@/lib/usage";
 
 // Haiku is fast and costs a fraction of a cent per formula. Override with
 // ANTHROPIC_MODEL if you want a larger model.
@@ -18,6 +18,32 @@ let client: Anthropic | null = null;
 function anthropic(): Anthropic {
   if (!client) client = new Anthropic({ maxRetries: 1, timeout: 30_000 });
   return client;
+}
+
+/**
+ * A short, non-sensitive label for why the Claude call failed. Shown to the
+ * visitor so the site owner can diagnose a broken deployment from a phone
+ * without opening the server logs.
+ */
+function failureReason(error: unknown): string {
+  const e = (error && typeof error === "object" ? error : {}) as {
+    status?: unknown;
+    name?: unknown;
+    message?: unknown;
+  };
+  const status = typeof e.status === "number" ? e.status : 0;
+  const message = typeof e.message === "string" ? e.message.toLowerCase() : "";
+  const name = typeof e.name === "string" ? e.name : "";
+
+  if (status === 401 || status === 403) return "api_key_rejected";
+  if (status === 404) return "model_not_found";
+  if (message.includes("credit balance")) return "no_api_credit";
+  if (status === 429) return "api_rate_limited";
+  if (status === 400) return "bad_request";
+  if (status >= 500) return "api_overloaded";
+  if (name.includes("Timeout") || message.includes("timed out")) return "timeout";
+  if (name.includes("Connection")) return "connection";
+  return "unknown";
 }
 
 function clientIp(req: Request): string {
@@ -74,7 +100,19 @@ export async function POST(req: Request) {
     );
   }
 
-  // 3. Per-user daily limit.
+  // 3. Don't charge anyone's allowance if the deployment can't reach Claude.
+  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
+    return Response.json(
+      {
+        error:
+          "This site isn't connected to the AI service yet. (Reason: api_key_missing)",
+        code: "not_configured",
+      },
+      { status: 503 }
+    );
+  }
+
+  // 4. Per-user daily limit.
   const limit =
     plan === "pro"
       ? envInt("PRO_DAILY_LIMIT", 200)
@@ -96,7 +134,7 @@ export async function POST(req: Request) {
     );
   }
 
-  // 4. Site-wide circuit breaker so a traffic spike can't drain the API balance.
+  // 5. Site-wide circuit breaker so a traffic spike can't drain the API balance.
   const globalUsage = await consume("global", envInt("GLOBAL_DAILY_CAP", 3000));
   if (!globalUsage.allowed) {
     return Response.json(
@@ -109,7 +147,7 @@ export async function POST(req: Request) {
     );
   }
 
-  // 5. Ask Claude.
+  // 6. Ask Claude.
   try {
     const { request } = parsed;
     const message = await anthropic().messages.create({
@@ -131,11 +169,15 @@ export async function POST(req: Request) {
     });
   } catch (error) {
     console.error("API Error:", error);
+    // The visitor got nothing, so don't count this against them.
+    await Promise.all([refund(userId), refund("global")]);
+    const reason = failureReason(error);
     return Response.json(
       {
-        error: "Failed to generate an answer. Please try again.",
+        error: `Failed to generate an answer. Please try again. (Reason: ${reason})`,
         code: "upstream",
-        usage: usageInfo,
+        reason,
+        usage: { ...usageInfo, used: Math.max(usageInfo.used - 1, 0) },
       },
       { status: 502 }
     );

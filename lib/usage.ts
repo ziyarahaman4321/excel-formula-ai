@@ -93,6 +93,34 @@ export async function consume(id: string, limit: number): Promise<UsageResult> {
   };
 }
 
+/**
+ * Give back one use, for when we counted a request and then failed to serve
+ * it. Best effort: a failure here just means the user keeps the charge.
+ */
+export async function refund(id: string): Promise<void> {
+  const key = `efa:${dayStamp()}:${id}`;
+  const cfg = redisConfig();
+  if (cfg) {
+    try {
+      const res = await fetch(`${cfg.url}/pipeline`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${cfg.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify([["DECR", key]]),
+        signal: AbortSignal.timeout(3000),
+        cache: "no-store",
+      });
+      if (res.ok) return;
+    } catch {
+      // fall through to the in-memory counter
+    }
+  }
+  const entry = memory.get(key);
+  if (entry && entry.count > 0) entry.count -= 1;
+}
+
 export function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
